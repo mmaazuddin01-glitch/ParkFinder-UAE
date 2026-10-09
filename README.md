@@ -1,1 +1,3 @@
-# ParkFinder-UAE
+# ParkFinder UAE (Streamlit)
+Run locally:  py -m streamlit run app.py
+Demo data only. Built with help from AI tools.
