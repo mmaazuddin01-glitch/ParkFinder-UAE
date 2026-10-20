@@ -32,6 +32,7 @@ import math
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -302,6 +303,9 @@ AR.update({
     "Source: OpenStreetMap volunteers. Live free/busy status is not available.": "المصدر: متطوعو OpenStreetMap. حالة الشغل المباشرة غير متوفرة.",
 })
 AR_SENTENCES.update({
+    "Loading the real parking places from OpenStreetMap in the background (about a minute the first time). Until then you see 26 demo places. Tap Refresh now in a moment.":
+        "جارٍ تحميل المواقف الحقيقية من OpenStreetMap في الخلفية (نحو دقيقة في المرة الأولى). حتى ذلك الحين ترى 26 موقعاً تجريبياً. اضغط تحديث الآن بعد لحظة.",
+    "Still loading, please wait a moment and tap again.": "ما زال التحميل جارياً، انتظر لحظة ثم اضغط مرة أخرى.",
     "ParkFinder UAE brings street bays and paid garages across Dubai, Sharjah and Ajman into one simple view, so you can see what is available, what it costs and how far you will walk before you set off.":
         "يجمع ParkFinder UAE مواقف الشوارع والمرائب المدفوعة في دبي والشارقة وعجمان في عرض واحد بسيط، لتعرف المتاح وتكلفته ومسافة المشي قبل أن تنطلق.",
     "Every listing shows whether it is free or paid, a street bay or a garage, its opening hours and how many spaces are free. Locations come from OpenStreetMap and refresh every 30 minutes. Live free-space counts are not published for them, so availability shows a typical estimate for the day and time (marked \"Usually...\"), replaced by driver reports when they exist, and the top suggestion is a simple visible score of distance, availability and price.":
@@ -314,6 +318,7 @@ AR_SENTENCES.update({
         "تأتي بلاغات المجتمع من مستخدمين مثلك. وهي معلّمة وتنتهي بعد ساعتين.",
 })
 AR_RULES += [(re.compile(p), r) for p, r in [
+    (r"Showing the last saved copy from (.+?) while OpenStreetMap loads in the background\. Tap Refresh now in a few seconds\.", r"نعرض آخر نسخة محفوظة من \1 بينما يُحمَّل OpenStreetMap في الخلفية. اضغط تحديث الآن بعد ثوانٍ."),
     (r"It is (very close|close|within reach|[\d.]+ km away), (.+?), and (.+)\.$", lambda m: "هو %s، %s، و%s." % (
         {"very close": "قريب جداً", "close": "قريب", "within reach": "في المتناول"}.get(m.group(1), m.group(1).replace(" km away", " كم")),
         _tr_text(m.group(2)), _tr_text(m.group(3)))),
@@ -370,8 +375,9 @@ def _wrap_widget(fn, with_options=False):
         for key in ("label", "placeholder", "help", "body", "value"):
             if isinstance(k.get(key), str) and key != "value":
                 k[key] = tr(k[key])
-        if with_options and "format_func" not in k and ss.get("lang") == "ar":
-            k["format_func"] = lambda o: tr(o) if isinstance(o, str) else o
+        if with_options and ss.get("lang") == "ar":
+            _ff = k.get("format_func")
+            k["format_func"] = lambda o, _ff=_ff: tr(str(_ff(o)) if _ff else o) if (_ff or isinstance(o, str)) else o
         return fn(*a, **k)
     return w
 for _n in ("markdown", "write", "caption", "title", "header", "subheader", "info", "warning", "error", "success", "toast",
@@ -813,7 +819,6 @@ def give_names(items, landmarks, suburbs):
             p["name"] = "%s in %s" % (word, p["city"])
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner="Updating parking locations from OpenStreetMap (the first load can take a minute)...")
 def osm_parkings():
     """Downloads every amenity=parking in Dubai, Sharjah and Ajman. Streamlit keeps the result for 30 minutes."""
     items, seen, landmarks, suburbs, failures = [], set(), [], [], []
@@ -843,25 +848,45 @@ def osm_parkings():
 
 
 @st.cache_resource
-def failure_note():
-    """Shared by all visitors: when OpenStreetMap last failed, so we don't hammer its busy server on every click."""
-    return {"t": 0.0, "error": ""}
+def osm_store():
+    """Shared by all visitors. The big OpenStreetMap download runs in the BACKGROUND so the first page opens at once."""
+    return {"data": None, "running": False, "failed": 0.0, "error": "", "lock": threading.Lock()}
+
+
+def _download_job(store):
+    try:
+        data = osm_parkings()
+        save_json("osm_cache.json", data)
+        store.update(data=data, error="", failed=0.0)
+    except Exception as error:
+        store.update(error="%s: %s" % (type(error).__name__, error), failed=time.time())
+    finally:
+        store["running"] = False
+
+
+def start_download(store):
+    with store["lock"]:
+        if store["running"]:
+            return
+        store["running"] = True
+    if os.environ.get("PF_SYNC"):                     # tests run it straight away
+        _download_job(store)
+    else:
+        threading.Thread(target=_download_job, args=(store,), daemon=True).start()
 
 
 def load_parkings():
-    """Sets the global PARKINGS / BY_ID. Order: fresh OSM data -> last saved copy -> 26 demo entries."""
+    """Sets the global PARKINGS / BY_ID. Shows what we have RIGHT AWAY (fresh data, else last saved copy, else 26 demo
+    places) and refreshes from OpenStreetMap in the background at most every 30 minutes."""
     global PARKINGS, BY_ID, DATA_INFO
-    info = {"source": "osm", "fetched": None, "error": ""}
-    note = failure_note()
-    try:
-        if time.time() - note["t"] < 90:           # failed a moment ago: use the fallback, retry after 90 seconds
-            raise RuntimeError(note["error"])
-        data = osm_parkings()
-        save_json("osm_cache.json", data)
-    except Exception as error:
-        info["error"] = "%s: %s" % (type(error).__name__, error) if not isinstance(error, RuntimeError) else str(error)
-        if not isinstance(error, RuntimeError):
-            note.update(t=time.time(), error=info["error"])
+    store = osm_store()
+    data = store["data"]
+    age = time.time() - data["fetched"] if data else None
+    if (data is None or age > REFRESH_SECONDS) and not store["running"] and time.time() - store["failed"] > 90:
+        start_download(store)
+        data = store["data"]
+    info = {"source": "osm", "fetched": None, "error": store["error"], "loading": store["running"]}
+    if not data:
         data = load_json("osm_cache.json", None)
         info["source"] = "saved copy" if data else "demo"
     if data and data.get("items"):
@@ -872,7 +897,7 @@ def load_parkings():
     DATA_INFO = info
 
 
-DATA_INFO = {"source": "demo", "fetched": None, "error": ""}
+DATA_INFO = {"source": "demo", "fetched": None, "error": "", "loading": False}
 
 
 def fmt_updated(ts):
@@ -880,20 +905,43 @@ def fmt_updated(ts):
 
 
 def cb_refresh_data():
-    st.cache_data.clear()
-    failure_note().update(t=0.0)
-    st.toast("Refreshing parking locations...")
+    store = osm_store()
+    store["failed"] = 0.0
+    if store["running"]:
+        st.toast("Still loading, please wait a moment and tap again.")
+    else:
+        start_download(store)
+        st.toast("Refreshing parking locations...")
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=4)
+    def watch_loading():
+        """While the background download runs, check every 4 seconds and refresh the page once it is done."""
+        if not osm_store()["running"]:
+            st.rerun()
+else:
+    def watch_loading():
+        return None
 
 
 def data_status(key):
     """Honest line about where the list comes from and when it was refreshed."""
     i = DATA_INFO
+    if i.get("loading"):
+        watch_loading()
     if i["source"] == "osm":
         st.caption("📡 %d parking places from OpenStreetMap · updated %s (UAE time) · refreshes every 30 minutes · "
                    "availability is a typical-pattern estimate unless drivers report." % (len(PARKINGS), fmt_updated(i["fetched"])))
     elif i["source"] == "saved copy":
-        st.warning("OpenStreetMap is busy right now, so this is the last saved copy from %s. Tap Refresh now in a minute." % fmt_updated(i["fetched"]))
-        st.caption("Technical detail: %s" % i["error"])
+        if i.get("loading"):
+            st.info("Showing the last saved copy from %s while OpenStreetMap loads in the background. Tap Refresh now in a few seconds." % fmt_updated(i["fetched"]))
+        else:
+            st.warning("OpenStreetMap is busy right now, so this is the last saved copy from %s. Tap Refresh now in a minute." % fmt_updated(i["fetched"]))
+            st.caption("Technical detail: %s" % i["error"])
+    elif i.get("loading"):
+        st.info("Loading the real parking places from OpenStreetMap in the background (about a minute the first time). "
+                "Until then you see 26 demo places. Tap Refresh now in a moment.")
     else:
         st.warning("OpenStreetMap's free server is busy right now, so only the 26 demo places are shown for the moment. "
                    "Wait a minute and tap Refresh now.")
